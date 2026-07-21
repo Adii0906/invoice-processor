@@ -1,14 +1,14 @@
 """
 OCR interface. process_image(file_path) -> raw_text
 
-PaddleOCR 3.x rewrote its API (paddlex-based pipeline). show_log and some
-old constructor args no longer exist, and .ocr() output format changed too.
-
-On Windows, the new PIR executor + oneDNN combo has a known bug
-(NotImplementedError: ConvertPirAttribute2RuntimeAttribute ... onednn).
-Disabling mkldnn before the paddle backend initializes works around it.
+Large phone-camera photos (often 3000-4000px on the long side) make
+PaddleOCR much slower than necessary. Text detection accuracy doesn't
+meaningfully improve past ~1600px on the long side for typical invoice
+photos, so we downscale before running OCR. This is the single biggest
+speed win available without changing the OCR engine itself.
 """
 import os
+from PIL import Image
 
 # must be set before paddle/paddleocr is imported
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
@@ -17,22 +17,41 @@ os.environ.setdefault("FLAGS_enable_pir_api", "0")
 from paddleocr import PaddleOCR
 
 _ocr_engine = None
+MAX_DIMENSION = 1600
 
 
 def get_ocr_engine():
     global _ocr_engine
     if _ocr_engine is None:
         try:
-            # current (3.x) API — mkldnn disabled via env vars above to avoid
-            # the Windows oneDNN/PIR NotImplementedError
             _ocr_engine = PaddleOCR(lang="en", enable_mkldnn=False)
         except TypeError:
-            # enable_mkldnn not accepted at this constructor level on some versions
             _ocr_engine = PaddleOCR(lang="en")
         except Exception:
-            # older (2.x) API fallback
             _ocr_engine = PaddleOCR(use_angle_cls=True, lang="en")
     return _ocr_engine
+
+
+def _downscale_if_needed(file_path: str) -> str:
+    """Resizes the image in place (writes a temp copy) if it's larger than
+    MAX_DIMENSION on the long side. Returns the path to use for OCR."""
+    try:
+        img = Image.open(file_path)
+        w, h = img.size
+        long_side = max(w, h)
+        if long_side <= MAX_DIMENSION:
+            return file_path
+
+        scale = MAX_DIMENSION / long_side
+        new_size = (int(w * scale), int(h * scale))
+        img = img.convert("RGB").resize(new_size, Image.LANCZOS)
+
+        resized_path = file_path + ".resized.jpg"
+        img.save(resized_path, "JPEG", quality=90)
+        return resized_path
+    except Exception:
+        # if resizing fails for any reason, fall back to the original file
+        return file_path
 
 
 def process_image(file_path: str) -> str:
@@ -42,21 +61,23 @@ def process_image(file_path: str) -> str:
     was detected, even if partial, rather than crashing.
     """
     engine = get_ocr_engine()
+    ocr_input_path = _downscale_if_needed(file_path)
+
     try:
-        result = engine.predict(file_path)
+        result = engine.predict(ocr_input_path)
     except AttributeError:
-        # very old versions only have .ocr()
-        result = engine.ocr(file_path, cls=True)
+        result = engine.ocr(ocr_input_path, cls=True)
+    finally:
+        if ocr_input_path != file_path and os.path.exists(ocr_input_path):
+            os.remove(ocr_input_path)
 
     if not result:
         return ""
 
     lines = []
     for page in result:
-        # 3.x pipeline result: dict-like object with 'rec_texts'
         if hasattr(page, "get") and page.get("rec_texts"):
             lines.extend(page["rec_texts"])
-        # 2.x list-of-lines format: [[box, (text, score)], ...]
         elif isinstance(page, list):
             for line in page:
                 try:

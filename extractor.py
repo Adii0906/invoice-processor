@@ -1,12 +1,17 @@
 """
 LLM extraction interface with constrained output + repair loop.
 Supports two backends:
-  - "ollama": fully local, calls a running Ollama server (default: mistral model)
+  - "ollama": fully local, calls a running Ollama server
   - "mistral_api": Mistral's cloud API, requires an API key
 
-Both paths go through the same schema validation + repair loop, so the
-differentiator (repair loop, attempt logging, zero regex fallback) applies
-regardless of which backend the user picks.
+Both paths go through the same schema validation + repair loop.
+
+Note on Qwen3 and other hybrid "thinking" models: by default they emit a
+long internal reasoning block wrapped in <think>...</think> before the
+real answer. This is slow and can break JSON parsing if the reasoning
+text leaks into the output. We disable thinking mode via Ollama's
+"think": false option and force strict JSON output via "format": "json",
+plus strip any stray <think> block as a safety net.
 """
 import json
 import re
@@ -15,12 +20,14 @@ from pydantic import ValidationError
 from schema import InvoiceExtraction
 
 MAX_REPAIR_ATTEMPTS = 3
+OLLAMA_TIMEOUT_SECONDS = 120
+MISTRAL_TIMEOUT_SECONDS = 60
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 
 SYSTEM_PROMPT = """You are an invoice data extraction assistant. Extract structured data from raw OCR text.
-Respond with ONLY a JSON object matching this exact schema, no other text, no markdown fences:
+Respond with ONLY a JSON object matching this exact schema, no other text, no markdown fences, no explanation:
 {
   "vendor_name": string,
   "invoice_date": string or null (YYYY-MM-DD format),
@@ -40,8 +47,15 @@ class ExtractionError(Exception):
 def _call_ollama(messages: list, model: str = "mistral") -> str:
     resp = requests.post(
         OLLAMA_URL,
-        json={"model": model, "messages": messages, "stream": False, "options": {"temperature": 0.1}},
-        timeout=60,
+        json={
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "format": "json",       # forces strict JSON output, no markdown/prose wrapping
+            "think": False,         # disables reasoning mode on Qwen3 and similar hybrid models
+            "options": {"temperature": 0.1, "num_predict": 512},
+        },
+        timeout=OLLAMA_TIMEOUT_SECONDS,
     )
     if resp.status_code != 200:
         raise ExtractionError(f"Ollama request failed ({resp.status_code}): {resp.text}")
@@ -53,7 +67,7 @@ def _call_mistral_api(messages: list, api_key: str, model: str = "mistral-small-
         MISTRAL_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={"model": model, "messages": messages, "temperature": 0.1, "response_format": {"type": "json_object"}},
-        timeout=60,
+        timeout=MISTRAL_TIMEOUT_SECONDS,
     )
     if resp.status_code != 200:
         raise ExtractionError(f"Mistral API request failed ({resp.status_code}): {resp.text}")
@@ -61,9 +75,9 @@ def _call_mistral_api(messages: list, api_key: str, model: str = "mistral-small-
 
 
 def _extract_json_block(text: str) -> str:
-    """Isolate the JSON object from model output (strips stray markdown fences etc).
-    This is not field-level regex extraction — the schema/repair loop still owns validation."""
-    text = text.strip()
+    """Strip any leaked <think> block and isolate the JSON object.
+    This is formatting cleanup only, not field-level extraction."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     text = re.sub(r"^```json\s*|\s*```$", "", text.strip())
     match = re.search(r"\{.*\}", text, re.DOTALL)
     return match.group(0) if match else text
@@ -102,6 +116,14 @@ def extract_fields(
                 raw_output = _call_mistral_api(messages, api_key=mistral_api_key, model=mistral_model)
             else:
                 raise ExtractionError(f"Unknown backend: {backend}")
+        except requests.exceptions.Timeout:
+            attempt_log.append({"attempt": attempt, "status": "timeout",
+                                 "error": f"Request exceeded {OLLAMA_TIMEOUT_SECONDS if backend == 'ollama' else MISTRAL_TIMEOUT_SECONDS}s"})
+            return None, attempt_log
+        except requests.exceptions.ConnectionError:
+            attempt_log.append({"attempt": attempt, "status": "connection_error",
+                                 "error": "Could not reach the backend. Is Ollama running (ollama serve)?"})
+            return None, attempt_log
         except ExtractionError as e:
             attempt_log.append({"attempt": attempt, "status": "backend_error", "error": str(e)})
             return None, attempt_log

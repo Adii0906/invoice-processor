@@ -2,9 +2,9 @@ import streamlit as st
 import os
 from ocr_module import process_image
 from extractor import extract_fields, check_ollama_available
-from db import init_db, save_invoice, query_invoices
+from db import init_db, save_invoice, query_invoices, get_categories_in_use
 
-st.set_page_config(page_title="InvoxAI - Local Invoice Extraction", layout="wide", page_icon="📄")
+st.set_page_config(page_title="InvoxAI - Local Invoice Extraction", layout="wide")
 init_db()
 
 # ---------- Styling ----------
@@ -19,16 +19,8 @@ st.markdown("""
         margin-bottom: 1.5rem;
     }
     .hiw-banner h3 { margin-top: 0; color: #e8eaed; }
-    .hiw-step {
-        display: inline-block;
-        background: #2d3548;
-        border-radius: 8px;
-        padding: 0.6rem 1rem;
-        margin: 0.3rem 0.3rem 0.3rem 0;
-        font-size: 0.85rem;
-        color: #c9cdd6;
-    }
-    .hiw-step b { color: #7dd3fc; }
+    .hiw-banner p { color: #c9cdd6; line-height: 1.6; margin-bottom: 0.8rem; }
+    .hiw-steps { color: #9aa1b0; font-size: 0.9rem; line-height: 1.8; }
     .badge-local {
         background: #0f3d2e; color: #4ade80; padding: 2px 10px;
         border-radius: 12px; font-size: 0.75rem; font-weight: 600;
@@ -52,28 +44,32 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------- Session state init ----------
-# Keyed by filename -> dict holding everything about that image across reruns.
-# This is what keeps results visible instead of vanishing on every interaction.
 if "images" not in st.session_state:
     st.session_state.images = {}
 
 # ---------- Header ----------
-st.title("📄 InvoxAI")
-st.caption("Local-first invoice digitization — your data never has to leave your machine.")
+st.title("InvoxAI")
+st.markdown('<span class="badge-local" style="font-size:0.9rem;">LOCAL AND PRIVATE BY DEFAULT</span>', unsafe_allow_html=True)
 
 st.markdown("""
 <div class="hiw-banner">
-<h3>⚙️ How it works</h3>
-<span class="hiw-step"><b>1. Upload</b> — drop one or more invoice/receipt images</span>
-<span class="hiw-step"><b>2. OCR</b> — text extracted locally</span>
-<span class="hiw-step"><b>3. Extract</b> — LLM converts text into strict structured JSON</span>
-<span class="hiw-step"><b>4. Validate + Repair</b> — schema-invalid output auto-corrected, zero regex fallback</span>
-<span class="hiw-step"><b>5. Review & Save</b> — confidence-scored fields, edit and save each independently</span>
+<h3>How it works</h3>
+<div class="hiw-steps">
+1. Upload an invoice or receipt image<br>
+2. OCR reads the text on your machine<br>
+3. AI converts the text into structured fields (vendor, date, amount, category)<br>
+4. Invalid output is auto corrected, not guessed with hardcoded rules<br>
+5. Review, edit, and save
+</div>
+<p style="margin-top:1rem; margin-bottom:0;">
+<b>Local mode:</b> everything above runs on your machine, nothing is sent online.<br>
+<b>Cloud mode:</b> pick "Mistral API" in the sidebar and paste your API key there. Only the extracted invoice text is sent to Mistral for that step.
+</p>
 </div>
 """, unsafe_allow_html=True)
 
 # ---------- Sidebar: backend selector ----------
-st.sidebar.header("🧠 Extraction Backend")
+st.sidebar.header("Extraction Backend")
 backend_choice = st.sidebar.radio(
     "Choose how invoices are processed",
     ["Local Ollama (private, offline)", "Mistral API (cloud, requires key)"],
@@ -86,17 +82,17 @@ mistral_model = "mistral-small-latest"
 
 if backend_choice.startswith("Local"):
     backend = "ollama"
-    st.sidebar.markdown('<span class="badge-local">100% LOCAL</span>', unsafe_allow_html=True)
+    st.sidebar.markdown('<span class="badge-local">LOCAL</span>', unsafe_allow_html=True)
     is_up, models = check_ollama_available()
     if is_up:
         st.sidebar.success(f"Ollama server detected ({len(models)} model(s) available)")
         if models:
             ollama_model = st.sidebar.selectbox("Model", models)
     else:
-        st.sidebar.error("Ollama not detected at localhost:11434. Run `ollama serve` and `ollama pull mistral`.")
+        st.sidebar.error("Ollama not detected at localhost:11434. Run 'ollama serve' and 'ollama pull mistral'.")
 else:
     backend = "mistral_api"
-    st.sidebar.markdown('<span class="badge-cloud">CLOUD API</span>', unsafe_allow_html=True)
+    st.sidebar.markdown('<span class="badge-cloud">CLOUD</span>', unsafe_allow_html=True)
     mistral_api_key = st.sidebar.text_input("Mistral API Key", type="password")
     mistral_model = st.sidebar.selectbox("Model", ["mistral-small-latest", "mistral-large-latest"])
     if not mistral_api_key:
@@ -105,21 +101,20 @@ else:
 st.sidebar.divider()
 st.sidebar.caption("Local mode never sends invoice data over the network. Cloud mode sends OCR text to Mistral's API.")
 
-if st.sidebar.button("🗑️ Clear all uploaded images"):
+if st.sidebar.button("Clear all uploaded images"):
     st.session_state.images = {}
     st.rerun()
 
 # ---------- Main tabs ----------
-tab1, tab2 = st.tabs(["📤 Upload & Process", "🔍 Search & Export"])
+tab1, tab2 = st.tabs(["Upload and Process", "Search and Export"])
 
 with tab1:
     uploaded_files = st.file_uploader(
-        "Upload invoice images (you can select multiple)",
+        "Upload invoice images. You can select multiple files at once.",
         type=["jpg", "jpeg", "png"],
         accept_multiple_files=True,
     )
 
-    # Register newly uploaded files into session state (once each, keyed by name)
     if uploaded_files:
         os.makedirs("uploads", exist_ok=True)
         for f in uploaded_files:
@@ -130,16 +125,15 @@ with tab1:
                 st.session_state.images[f.name] = {
                     "file_path": file_path,
                     "raw_text": None,
-                    "result": None,       # dict of extracted fields once extracted
+                    "result": None,
                     "attempt_log": None,
                     "saved": False,
+                    "last_error": None,
                 }
 
     if not st.session_state.images:
         st.info("Upload one or more invoice images to get started.")
 
-    # Render one card per image, independently — extracting/saving one
-    # doesn't touch the others, and everything survives reruns.
     for fname, state in list(st.session_state.images.items()):
         with st.container():
             st.markdown('<div class="img-card">', unsafe_allow_html=True)
@@ -149,15 +143,14 @@ with tab1:
                 st.image(state["file_path"], use_container_width=True)
                 st.caption(fname)
                 if state["saved"]:
-                    st.markdown('<span class="badge-saved">✅ SAVED</span>', unsafe_allow_html=True)
+                    st.markdown('<span class="badge-saved">SAVED</span>', unsafe_allow_html=True)
                 if st.button("Remove", key=f"remove_{fname}"):
                     del st.session_state.images[fname]
                     st.rerun()
 
             with col_main:
-                # Run OCR once, cache in state
                 if state["raw_text"] is None:
-                    with st.spinner(f"Running OCR on {fname}..."):
+                    with st.spinner(f"Running OCR on {fname}"):
                         state["raw_text"] = process_image(state["file_path"])
 
                 with st.expander("Raw OCR text", expanded=False):
@@ -166,8 +159,12 @@ with tab1:
                 extract_disabled = (backend == "mistral_api" and not mistral_api_key)
 
                 if state["result"] is None:
+                    if state.get("last_error"):
+                        st.error(state["last_error"])
+
                     if st.button("Extract structured data", key=f"extract_{fname}", type="primary", disabled=extract_disabled):
-                        with st.spinner(f"Extracting {fname} via {backend_choice}..."):
+                        spinner_msg = f"Extracting {fname} via {backend_choice}. Local models can take 20 to 90 seconds depending on your hardware, please wait."
+                        with st.spinner(spinner_msg):
                             result, attempt_log = extract_fields(
                                 state["raw_text"],
                                 backend=backend,
@@ -176,8 +173,17 @@ with tab1:
                                 mistral_model=mistral_model,
                             )
                         state["attempt_log"] = attempt_log
+                        state["last_error"] = None
                         if result is not None:
                             state["result"] = result.model_dump()
+                        else:
+                            last_status = attempt_log[-1]["status"] if attempt_log else "unknown"
+                            if last_status == "timeout":
+                                state["last_error"] = "The model took too long to respond and the request timed out. Try a smaller/faster model, or check Ollama is running properly."
+                            elif last_status == "connection_error":
+                                state["last_error"] = "Could not reach Ollama. Make sure 'ollama serve' is running."
+                            else:
+                                state["last_error"] = "Extraction failed after all repair attempts. See the attempt log below for details."
                         st.rerun()
                 else:
                     result = state["result"]
@@ -186,8 +192,8 @@ with tab1:
                         st.json(state["attempt_log"])
 
                     conf = result["confidence"]
-                    conf_color = "🟢" if conf >= 0.8 else ("🟡" if conf >= 0.5 else "🔴")
-                    st.markdown(f"**Confidence:** {conf_color} {conf:.2f}")
+                    conf_label = "High" if conf >= 0.8 else ("Medium" if conf >= 0.5 else "Low")
+                    st.markdown(f"**Confidence:** {conf_label} ({conf:.2f})")
 
                     c1, c2 = st.columns(2)
                     with c1:
@@ -203,7 +209,7 @@ with tab1:
                     col_save, col_reextract = st.columns(2)
                     with col_save:
                         if not state["saved"]:
-                            if st.button("💾 Save to database", key=f"save_{fname}"):
+                            if st.button("Save to database", key=f"save_{fname}"):
                                 save_invoice({
                                     "vendor_name": vendor, "invoice_date": inv_date or None,
                                     "total_amount": total, "tax_amount": tax,
@@ -215,35 +221,63 @@ with tab1:
                         else:
                             st.success("Saved")
                     with col_reextract:
-                        if st.button("🔄 Re-extract", key=f"reextract_{fname}"):
+                        if st.button("Re-extract", key=f"reextract_{fname}"):
                             state["result"] = None
                             state["attempt_log"] = None
                             state["saved"] = False
+                            state["last_error"] = None
                             st.rerun()
 
             st.markdown('</div>', unsafe_allow_html=True)
 
 with tab2:
     st.subheader("Search Invoices")
-    c1, c2 = st.columns(2)
-    with c1:
-        vendor_filter = st.text_input("Filter by vendor")
-        category_filter = st.selectbox("Filter by category", ["All", "Office", "IT", "Travel", "Food", "Utilities", "Other"])
-    with c2:
-        date_from = st.text_input("From date (YYYY-MM-DD)")
-        date_to = st.text_input("To date (YYYY-MM-DD)")
+    search_text = st.text_input("Search vendor or description", placeholder="e.g. Amazon, office supplies, electricity")
+
+    with st.expander("More filters"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            existing_categories = get_categories_in_use()
+            category_filter = st.selectbox("Category", ["All"] + existing_categories)
+        with c2:
+            date_from = st.text_input("From date (YYYY-MM-DD)")
+            date_to = st.text_input("To date (YYYY-MM-DD)")
+        with c3:
+            amount_min = st.number_input("Min amount", value=0.0, min_value=0.0)
+            amount_max = st.number_input("Max amount", value=0.0, min_value=0.0, help="Leave at 0 to skip this filter")
+        sort_col = st.selectbox("Sort by", ["created_at", "invoice_date", "total_amount", "vendor_name"], index=0)
+        sort_desc = st.checkbox("Newest / highest first", value=True)
+
+    total_saved = len(query_invoices())
+    st.caption(f"{total_saved} invoice(s) saved in total")
 
     df = query_invoices(
-        vendor=vendor_filter or None,
+        search_text=search_text or None,
         category=None if category_filter == "All" else category_filter,
         date_from=date_from or None,
         date_to=date_to or None,
+        amount_min=amount_min if amount_min > 0 else None,
+        amount_max=amount_max if amount_max > 0 else None,
+        sort_by=sort_col,
+        sort_desc=sort_desc,
     )
-    st.dataframe(df, use_container_width=True)
 
-    if not df.empty:
+    if df.empty and total_saved == 0:
+        st.info("No invoices saved yet. Extract and save one from the Upload tab first.")
+    elif df.empty:
+        st.info("No invoices match your current filters. Try clearing them or checking spelling.")
+    else:
+        st.caption(f"{len(df)} matching this search")
+        display_df = df[["vendor_name", "invoice_date", "total_amount", "tax_amount", "category", "description", "confidence"]]
+        st.dataframe(display_df, use_container_width=True)
+
         st.subheader("Spending Summary")
-        st.bar_chart(df.groupby("category")["total_amount"].sum())
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.bar_chart(df.groupby("category")["total_amount"].sum())
+        with col_b:
+            st.metric("Total spend (filtered)", f"{df['total_amount'].sum():.2f}")
+            st.metric("Average per invoice", f"{df['total_amount'].mean():.2f}")
 
-        csv = df.to_csv(index=False).encode("utf-8")
+        csv = display_df.to_csv(index=False).encode("utf-8")
         st.download_button("Export to CSV", csv, "invoices_export.csv", "text/csv")
