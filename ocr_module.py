@@ -9,12 +9,19 @@ speed win available without changing the OCR engine itself.
 """
 import os
 from PIL import Image
+import logging
 
 # must be set before paddle/paddleocr is imported
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("FLAGS_enable_pir_api", "0")
 
-from paddleocr import PaddleOCR
+try:
+    from paddleocr import PaddleOCR
+    OCR_AVAILABLE = True
+except Exception:
+    PaddleOCR = None
+    OCR_AVAILABLE = False
+    logging.getLogger(__name__).warning("paddleocr or its dependencies are not available; OCR will be disabled")
 
 _ocr_engine = None
 MAX_DIMENSION = 1600
@@ -23,6 +30,17 @@ MAX_DIMENSION = 1600
 def get_ocr_engine():
     global _ocr_engine
     if _ocr_engine is None:
+        if not OCR_AVAILABLE:
+            class _DummyOCR:
+                def predict(self, *a, **k):
+                    return []
+
+                def ocr(self, *a, **k):
+                    return []
+
+            _ocr_engine = _DummyOCR()
+            return _ocr_engine
+
         try:
             _ocr_engine = PaddleOCR(lang="en", enable_mkldnn=False)
         except TypeError:
@@ -64,6 +82,7 @@ def process_image(file_path: str) -> str:
     ocr_input_path = _downscale_if_needed(file_path)
 
     try:
+        # Dummy engine returns empty list when paddleocr isn't installed
         result = engine.predict(ocr_input_path)
     except AttributeError:
         result = engine.ocr(ocr_input_path, cls=True)
