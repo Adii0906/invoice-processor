@@ -1,6 +1,6 @@
 streamlit>=1.35.0
 paddleocr>=2.7.0
-paddlepaddle>=2.5.0
+paddlepaddle==2.6.2
 requests>=2.31.0
 pydantic>=2.5.0
 pandas>=2.0.0
