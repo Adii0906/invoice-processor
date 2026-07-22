@@ -1,6 +1,9 @@
+pip>=23.0
+# Streamlit Cloud: pin Python in runtime.txt (e.g. python-3.10.12)
+# Only install paddlepaddle/paddleocr on CPython < 3.11 where wheels exist
 streamlit>=1.35.0
-paddleocr>=2.7.0
-paddlepaddle==2.6.2
+paddleocr>=2.7.0; python_version < "3.11" and platform_python_implementation == "CPython"
+paddlepaddle==2.6.2; python_version < "3.11" and platform_python_implementation == "CPython"
 requests>=2.31.0
 pydantic>=2.5.0
 pandas>=2.0.0

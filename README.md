@@ -25,6 +25,12 @@ Upload an invoice image and InvoxAI extracts vendor, date, amount, tax, and cate
 
 Requires Python, and either a local Ollama installation (for offline mode) or a Mistral API key (for cloud mode). Install dependencies, start the app, and choose your backend from the sidebar.
 
+Streamlit Cloud notes:
+
+- Add a `runtime.txt` with the desired Python version (we recommend `python-3.10.12`) at the repo root to ensure compatible wheels for `paddlepaddle`.
+- `paddlepaddle` and `paddleocr` are only installed automatically when running on CPython < 3.11 to avoid build failures on unsupported Python versions.
+- If you need to run on a newer Python, install a compatible `paddlepaddle` manually or enable pre-releases locally with `pip install --pre paddlepaddle`.
+
 ## Status
 
 Built for a hackathon focused on private, reliable document extraction.
